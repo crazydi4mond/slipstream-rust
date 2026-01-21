@@ -34,6 +34,8 @@ pub(crate) enum ConnectionAuthState {
 struct ConnectionState {
     auth_state: ConnectionAuthState,
     auth_buffer: Vec<u8>,
+    /// When server has no auth, tracks if stream 0 is being used for data (old client)
+    stream0_is_data: bool,
 }
 
 pub(crate) struct ServerState {
@@ -79,6 +81,7 @@ impl ServerState {
                     ConnectionAuthState::NotRequired
                 },
                 auth_buffer: Vec::new(),
+                stream0_is_data: false,
             })
     }
 
@@ -176,23 +179,15 @@ pub(crate) unsafe extern "C" fn server_callback(
             } else {
                 &[]
             };
-            // Stream 0 is reserved for authentication; never use it for data
+            // Stream 0 handling depends on auth configuration
             if stream_id == AUTH_STREAM_ID {
                 if state.auth_token.is_some() {
+                    // Auth required: handle as auth stream
                     handle_auth_stream(cnx, state, data, fin);
-                } else if fin {
-                    // No auth configured but client sent auth request - respond with success
-                    // to indicate auth is not required
-                    let response = build_auth_response(AuthStatus::Success);
-                    let _ = unsafe {
-                        picoquic_add_to_stream(
-                            cnx,
-                            AUTH_STREAM_ID,
-                            response.as_ptr(),
-                            response.len(),
-                            1, // fin
-                        )
-                    };
+                } else {
+                    // No auth configured: check if this looks like an auth request from new client
+                    // or data from old client. Auth requests are exactly 33 bytes starting with 0x01.
+                    handle_stream0_no_auth(cnx, state, data, fin);
                 }
             } else {
                 handle_stream_data(cnx, state, stream_id, fin, data);
@@ -452,6 +447,80 @@ fn handle_auth_stream(cnx: *mut picoquic_cnx_t, state: &mut ServerState, data: &
             let _ = picoquic_close(cnx, SLIPSTREAM_INTERNAL_ERROR);
         }
     }
+}
+
+/// Handle stream 0 when server has no auth configured.
+/// Distinguishes between new clients sending auth requests and old clients using stream 0 for data.
+fn handle_stream0_no_auth(
+    cnx: *mut picoquic_cnx_t,
+    state: &mut ServerState,
+    data: &[u8],
+    fin: bool,
+) {
+    let cnx_id = cnx as usize;
+    let conn = state.get_or_create_connection(cnx_id);
+
+    // If we've already determined stream 0 is being used for data, forward it
+    if conn.stream0_is_data {
+        handle_stream_data(cnx, state, AUTH_STREAM_ID, fin, data);
+        return;
+    }
+
+    // Check first byte to determine if this is an auth request or data
+    let first_byte = conn
+        .auth_buffer
+        .first()
+        .copied()
+        .or_else(|| data.first().copied());
+
+    if first_byte != Some(0x01) {
+        // First byte is not auth request type - this is data from an old client
+        conn.stream0_is_data = true;
+        // Forward any buffered data plus current data
+        let mut all_data = std::mem::take(&mut conn.auth_buffer);
+        all_data.extend_from_slice(data);
+        handle_stream_data(cnx, state, AUTH_STREAM_ID, fin, &all_data);
+        return;
+    }
+
+    // First byte is 0x01 - might be auth request, buffer until we can confirm
+    let remaining_capacity = AUTH_REQUEST_SIZE.saturating_sub(conn.auth_buffer.len());
+    let bytes_to_add = data.len().min(remaining_capacity);
+    conn.auth_buffer.extend_from_slice(&data[..bytes_to_add]);
+
+    // If we received more data than auth request size, it's not auth
+    if data.len() > remaining_capacity {
+        conn.stream0_is_data = true;
+        let mut all_data = std::mem::take(&mut conn.auth_buffer);
+        all_data.extend_from_slice(&data[bytes_to_add..]);
+        handle_stream_data(cnx, state, AUTH_STREAM_ID, fin, &all_data);
+        return;
+    }
+
+    // Check if we have a complete auth request with FIN
+    if conn.auth_buffer.len() == AUTH_REQUEST_SIZE && fin {
+        // Valid auth request from new client - respond with success
+        conn.auth_buffer.clear();
+        let response = build_auth_response(AuthStatus::Success);
+        let _ = unsafe {
+            picoquic_add_to_stream(
+                cnx,
+                AUTH_STREAM_ID,
+                response.as_ptr(),
+                response.len(),
+                1, // fin
+            )
+        };
+        return;
+    }
+
+    // If FIN received before complete auth request, treat as data
+    if fin {
+        conn.stream0_is_data = true;
+        let all_data = std::mem::take(&mut conn.auth_buffer);
+        handle_stream_data(cnx, state, AUTH_STREAM_ID, true, &all_data);
+    }
+    // Otherwise, continue buffering
 }
 
 fn handle_stream_data(
