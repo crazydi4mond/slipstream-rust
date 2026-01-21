@@ -18,6 +18,7 @@ Common flags:
 - --congestion-control <bbr|dcubic> (optional; overrides congestion control for all resolvers)
 - --cert <PATH> (optional; PEM-encoded server certificate for strict leaf pinning)
 - --authoritative <IP:PORT> (repeatable; mark a resolver path as authoritative and use pacing-based polling)
+- --auth-token <TOKEN> (optional; authenticate with the server using this token)
 - --gso (currently not implemented in the Rust loop; prints a warning)
 - --keep-alive-interval <SECONDS> (default: 400)
 
@@ -62,6 +63,7 @@ Common flags:
 - --dns-listen-host <HOST> (default: ::)
 - --dns-listen-port <PORT> (default: 53)
 - --target-address <HOST:PORT> (default: 127.0.0.1:5201)
+- --auth-token <TOKEN> (optional; require clients to authenticate with this token)
 - --fallback <HOST:PORT> (optional; forward non-DNS packets to this UDP endpoint)
 - When binding to ::, slipstream attempts to enable dual-stack (IPV6_V6ONLY=0); if your OS disallows it, IPv4 DNS clients require sysctl changes or binding to an IPv4 address.
 - With --fallback enabled, peers that have recently sent DNS stay DNS-only; while active they switch to fallback only after 16 consecutive non-DNS packets to avoid diverting DNS on stray traffic. DNS-only classification expires after an idle timeout without DNS traffic.

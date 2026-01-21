@@ -8,6 +8,7 @@ This repository hosts the Rust rewrite of the [original C implementation](https:
 - slipstream-client and slipstream-server CLI binaries.
 - A DNS codec crate with vector-based tests.
 - picoquic FFI integration for multipath QUIC support.
+- Optional token-based authentication (`--auth-token`).
 - Fully async with tokio.
 - And more! For a more up-to-date list of extra features, see the [merged PRs](https://github.com/Mygod/slipstream-rust/pulls?q=is%3Apr+is%3Amerged+label%3Aenhancement).
 
