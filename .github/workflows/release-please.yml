@@ -82,10 +82,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: artifacts
-        run: |
-          for file in slipstream-*; do
-            sha256sum "$file" > "$file.sha256"
-          done
+        run: sha256sum slipstream-* > SHA256SUMS
 
       - name: Upload release assets
         env:
