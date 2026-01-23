@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  # Temporarily disabled for debugging release workflow
-  # push:
-  # pull_request:
+  push:
+  pull_request:
   workflow_dispatch:
 
 jobs:
