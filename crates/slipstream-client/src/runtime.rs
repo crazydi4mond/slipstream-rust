@@ -439,20 +439,23 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             if streams_len > 0 && has_ready_stream && flow_blocked {
                 let now = unsafe { picoquic_current_time() };
                 if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
+                    let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
                     let (enqueued_bytes, last_enqueue_at) =
                         unsafe { (*state_ptr).debug_snapshot() };
-                    let queued_bytes_total = unsafe { (*state_ptr).queued_bytes_total() };
                     let last_enqueue_ms = if last_enqueue_at == 0 {
                         0
                     } else {
                         now.saturating_sub(last_enqueue_at) / 1_000
                     };
                     error!(
-                        "connection flow blocked: streams={} queued_bytes_total={} enqueued_bytes={} last_enqueue_at={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={}",
+                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_fin_enqueued={} streams_discarding={} streams_with_data_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={}",
                         streams_len,
-                        queued_bytes_total,
+                        metrics.streams_with_rx_queued,
+                        metrics.queued_bytes_total,
+                        metrics.streams_with_fin_enqueued,
+                        metrics.streams_discarding,
+                        metrics.streams_with_data_rx,
                         enqueued_bytes,
-                        last_enqueue_at,
                         last_enqueue_ms,
                         zero_send_with_streams,
                         zero_send_loops,
@@ -549,6 +552,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             let report_time = unsafe { picoquic_current_time() };
             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
+            let streams_len = unsafe { (*state_ptr).streams_len() };
             for resolver in resolvers.iter_mut() {
                 resolver.debug.enqueued_bytes = enqueued_bytes;
                 resolver.debug.last_enqueue_at = last_enqueue_at;

@@ -35,6 +35,15 @@ pub(crate) struct ClientState {
     debug_last_enqueue_at: u64,
 }
 
+#[derive(Default)]
+pub(crate) struct ClientStreamMetrics {
+    pub(crate) streams_with_rx_queued: usize,
+    pub(crate) queued_bytes_total: u64,
+    pub(crate) streams_with_fin_enqueued: usize,
+    pub(crate) streams_discarding: usize,
+    pub(crate) streams_with_data_rx: usize,
+}
+
 impl ClientState {
     pub(crate) fn new(
         command_tx: mpsc::UnboundedSender<Command>,
@@ -71,12 +80,26 @@ impl ClientState {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
     }
 
-    pub(crate) fn queued_bytes_total(&self) -> u64 {
-        let mut queued_bytes = 0u64;
+    pub(crate) fn stream_debug_metrics(&self) -> ClientStreamMetrics {
+        let mut metrics = ClientStreamMetrics::default();
         for stream in self.streams.values() {
-            queued_bytes = queued_bytes.saturating_add(stream.flow.queued_bytes as u64);
+            let queued = stream.flow.queued_bytes as u64;
+            metrics.queued_bytes_total = metrics.queued_bytes_total.saturating_add(queued);
+            if queued > 0 {
+                metrics.streams_with_rx_queued = metrics.streams_with_rx_queued.saturating_add(1);
+            }
+            if stream.fin_enqueued {
+                metrics.streams_with_fin_enqueued =
+                    metrics.streams_with_fin_enqueued.saturating_add(1);
+            }
+            if stream.flow.discarding {
+                metrics.streams_discarding = metrics.streams_discarding.saturating_add(1);
+            }
+            if stream.data_rx.is_some() {
+                metrics.streams_with_data_rx = metrics.streams_with_data_rx.saturating_add(1);
+            }
         }
-        queued_bytes
+        metrics
     }
 
     pub(crate) fn take_path_events(&mut self) -> Vec<PathEvent> {

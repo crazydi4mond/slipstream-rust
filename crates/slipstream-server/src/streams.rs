@@ -31,6 +31,37 @@ pub(crate) struct ServerState {
     last_command_report: Instant,
 }
 
+#[derive(Default)]
+pub(crate) struct ServerStreamMetrics {
+    pub(crate) streams_total: usize,
+    pub(crate) streams_with_write_tx: usize,
+    pub(crate) streams_with_data_rx: usize,
+    pub(crate) streams_with_pending_data: usize,
+    pub(crate) pending_chunks_total: usize,
+    pub(crate) pending_bytes_total: u64,
+    pub(crate) queued_bytes_total: u64,
+    pub(crate) streams_with_pending_fin: usize,
+    pub(crate) streams_with_fin_enqueued: usize,
+    pub(crate) streams_with_target_fin_pending: usize,
+    pub(crate) streams_with_send_pending: usize,
+    pub(crate) streams_with_send_stash: usize,
+    pub(crate) send_stash_bytes_total: u64,
+    pub(crate) streams_discarding: usize,
+    pub(crate) streams_close_after_flush: usize,
+    pub(crate) multi_stream: bool,
+}
+
+impl ServerStreamMetrics {
+    pub(crate) fn has_backlog(&self) -> bool {
+        self.queued_bytes_total > 0
+            || self.pending_chunks_total > 0
+            || self.streams_with_pending_fin > 0
+            || self.streams_with_send_pending > 0
+            || self.streams_with_send_stash > 0
+            || self.streams_with_target_fin_pending > 0
+    }
+}
+
 impl ServerState {
     pub(crate) fn new(
         target_addr: SocketAddr,
@@ -48,6 +79,76 @@ impl ServerState {
             command_counts: CommandCounts::default(),
             last_command_report: Instant::now(),
         }
+    }
+
+    pub(crate) fn stream_debug_metrics(&self, cnx_id: usize) -> ServerStreamMetrics {
+        let mut metrics = ServerStreamMetrics {
+            multi_stream: self.multi_streams.contains(&cnx_id),
+            ..ServerStreamMetrics::default()
+        };
+        for (key, stream) in self.streams.iter() {
+            if key.cnx != cnx_id {
+                continue;
+            }
+            metrics.streams_total = metrics.streams_total.saturating_add(1);
+            if stream.write_tx.is_some() {
+                metrics.streams_with_write_tx = metrics.streams_with_write_tx.saturating_add(1);
+            }
+            if stream.data_rx.is_some() {
+                metrics.streams_with_data_rx = metrics.streams_with_data_rx.saturating_add(1);
+            }
+            let queued = stream.flow.queued_bytes as u64;
+            metrics.queued_bytes_total = metrics.queued_bytes_total.saturating_add(queued);
+            if !stream.pending_data.is_empty() {
+                metrics.streams_with_pending_data =
+                    metrics.streams_with_pending_data.saturating_add(1);
+                metrics.pending_chunks_total = metrics
+                    .pending_chunks_total
+                    .saturating_add(stream.pending_data.len());
+                let pending_bytes: u64 = stream
+                    .pending_data
+                    .iter()
+                    .map(|chunk| chunk.len() as u64)
+                    .sum();
+                metrics.pending_bytes_total =
+                    metrics.pending_bytes_total.saturating_add(pending_bytes);
+            }
+            if stream.pending_fin {
+                metrics.streams_with_pending_fin =
+                    metrics.streams_with_pending_fin.saturating_add(1);
+            }
+            if stream.fin_enqueued {
+                metrics.streams_with_fin_enqueued =
+                    metrics.streams_with_fin_enqueued.saturating_add(1);
+            }
+            if stream.target_fin_pending {
+                metrics.streams_with_target_fin_pending =
+                    metrics.streams_with_target_fin_pending.saturating_add(1);
+            }
+            if let Some(flag) = stream.send_pending.as_ref() {
+                if flag.load(Ordering::SeqCst) {
+                    metrics.streams_with_send_pending =
+                        metrics.streams_with_send_pending.saturating_add(1);
+                }
+            }
+            if let Some(stash) = stream.send_stash.as_ref() {
+                if !stash.is_empty() {
+                    metrics.streams_with_send_stash =
+                        metrics.streams_with_send_stash.saturating_add(1);
+                    metrics.send_stash_bytes_total = metrics
+                        .send_stash_bytes_total
+                        .saturating_add(stash.len() as u64);
+                }
+            }
+            if stream.flow.discarding {
+                metrics.streams_discarding = metrics.streams_discarding.saturating_add(1);
+            }
+            if stream.close_after_flush {
+                metrics.streams_close_after_flush =
+                    metrics.streams_close_after_flush.saturating_add(1);
+            }
+        }
+        metrics
     }
 }
 

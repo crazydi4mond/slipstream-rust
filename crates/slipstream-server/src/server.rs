@@ -7,7 +7,8 @@ use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_create, picoquic_current_time, picoquic_delete_cnx,
     picoquic_get_first_cnx, picoquic_get_next_cnx, picoquic_prepare_packet_ex, picoquic_quic_t,
-    slipstream_server_cc_algorithm, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
+    slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_server_cc_algorithm,
+    PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
 };
 use slipstream_ffi::{
     configure_quic_with_custom, socket_addr_to_storage, take_crypto_errors, QuicGuard,
@@ -40,6 +41,7 @@ const QUIC_MTU: u32 = 900;
 pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
+const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -279,6 +281,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
+    let mut last_flow_block_log_at: u64 = 0;
 
     loop {
         drain_commands(state_ptr, &mut command_rx);
@@ -397,6 +400,43 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
                 };
                 if ret < 0 {
                     return Err(ServerError::new("Failed to prepare QUIC packet"));
+                }
+
+                if send_length == 0 {
+                    let cnx_id = slot.cnx as usize;
+                    let metrics = unsafe { (&*state_ptr).stream_debug_metrics(cnx_id) };
+                    if metrics.streams_total > 0
+                        && metrics.has_backlog()
+                        && loop_time.saturating_sub(last_flow_block_log_at)
+                            >= FLOW_BLOCKED_LOG_INTERVAL_US
+                    {
+                        let flow_blocked = unsafe { slipstream_is_flow_blocked(slot.cnx) != 0 };
+                        let has_ready_stream =
+                            unsafe { slipstream_has_ready_stream(slot.cnx) != 0 };
+                        tracing::warn!(
+                            "server connection stalled: cnx={} streams={} streams_with_write_tx={} streams_with_data_rx={} queued_bytes_total={} streams_with_pending_data={} pending_chunks_total={} pending_bytes_total={} streams_with_pending_fin={} streams_with_fin_enqueued={} streams_with_target_fin_pending={} streams_with_send_pending={} streams_with_send_stash={} send_stash_bytes_total={} streams_discarding={} streams_close_after_flush={} multi_stream={} flow_blocked={} has_ready_stream={}",
+                            cnx_id,
+                            metrics.streams_total,
+                            metrics.streams_with_write_tx,
+                            metrics.streams_with_data_rx,
+                            metrics.queued_bytes_total,
+                            metrics.streams_with_pending_data,
+                            metrics.pending_chunks_total,
+                            metrics.pending_bytes_total,
+                            metrics.streams_with_pending_fin,
+                            metrics.streams_with_fin_enqueued,
+                            metrics.streams_with_target_fin_pending,
+                            metrics.streams_with_send_pending,
+                            metrics.streams_with_send_stash,
+                            metrics.send_stash_bytes_total,
+                            metrics.streams_discarding,
+                            metrics.streams_close_after_flush,
+                            metrics.multi_stream,
+                            flow_blocked,
+                            has_ready_stream
+                        );
+                        last_flow_block_log_at = loop_time;
+                    }
                 }
             }
 
@@ -534,6 +574,11 @@ fn maybe_gc_idle_connections(
     let active = collect_active_connections(quic);
     if active.is_empty() {
         last_seen.clear();
+        *last_gc = now;
+        return;
+    }
+
+    if last_seen.is_empty() {
         *last_gc = now;
         return;
     }
