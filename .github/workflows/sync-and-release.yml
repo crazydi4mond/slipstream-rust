@@ -1,0 +1,217 @@
+name: Sync Upstream and Release
+
+on:
+  schedule:
+    # Every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force a release even if no new commits'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/crazydi4mond/slipstream-rust.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.sync.outputs.new_commits }}
+      release_tag: ${{ steps.version.outputs.tag }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          # Add upstream remote
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream main
+
+          # Get upstream SHA
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          echo "Upstream SHA: $UPSTREAM_SHA"
+
+          # Check if upstream/main is already an ancestor of HEAD (we're up to date or ahead)
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            # Check if we're exactly at upstream or ahead
+            LOCAL_BASE=$(git merge-base HEAD upstream/main)
+            if [ "$LOCAL_BASE" = "$UPSTREAM_SHA" ]; then
+              echo "Already up to date with upstream (workflow commit is on top)"
+              echo "new_commits=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Already up to date with upstream"
+              echo "new_commits=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "New commits found in upstream, rebasing..."
+
+            # Rebase our commits (workflow file) on top of upstream
+            # This keeps our workflow commit always on top
+            git rebase upstream/main
+
+            # Force push (safe because we're the only ones pushing to this fork)
+            git push --force-with-lease origin main
+
+            echo "new_commits=true" >> "$GITHUB_OUTPUT"
+            echo "short_sha=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate CalVer tag
+        id: version
+        if: steps.sync.outputs.new_commits == 'true' || inputs.force_release == 'true'
+        run: |
+          # Generate base CalVer tag: v2026.01.24
+          BASE_TAG="v$(date -u +'%Y.%m.%d')"
+
+          # Check if this tag already exists, if so add a suffix
+          SUFFIX=0
+          TAG="$BASE_TAG"
+
+          # Fetch all tags
+          git fetch --tags
+
+          while git rev-parse "$TAG" >/dev/null 2>&1; do
+            SUFFIX=$((SUFFIX + 1))
+            TAG="${BASE_TAG}.${SUFFIX}"
+          done
+
+          echo "Generated tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ needs.sync.outputs.release_tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 50
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get commits since last tag (or last 10 if no tags)
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -n "$LAST_TAG" ]; then
+            echo "Generating notes since $LAST_TAG"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" "$LAST_TAG"..HEAD | head -50)
+          else
+            echo "No previous tag found, using recent commits"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" -10)
+          fi
+
+          # Write to file to preserve newlines
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "Synced from upstream [crazydi4mond/slipstream-rust](https://github.com/crazydi4mond/slipstream-rust)"
+            echo ""
+            echo "### Commits"
+            echo "$COMMITS"
+            echo ""
+            echo "---"
+            echo "*This is an automated release from the upstream repository.*"
+          } > release_notes.md
+
+          cat release_notes.md
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.sync.outputs.release_tag }}" \
+            --title "${{ needs.sync.outputs.release_tag }}" \
+            --notes-file release_notes.md \
+            --target main
+
+  build:
+    needs: [sync, release]
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: linux-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev python3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build picoquic
+        run: ./scripts/build_picoquic.sh
+
+      - name: Build release binaries
+        run: cargo build --release -p slipstream-client -p slipstream-server
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp target/release/slipstream-client artifacts/slipstream-client-${{ matrix.artifact_name }}
+          cp target/release/slipstream-server artifacts/slipstream-server-${{ matrix.artifact_name }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.artifact_name }}
+          path: artifacts/
+
+  upload-assets:
+    needs: [sync, release, build]
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum slipstream-* > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.sync.outputs.release_tag }}" \
+            artifacts/* \
+            --repo ${{ github.repository }}
